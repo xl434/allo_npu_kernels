@@ -3,6 +3,32 @@ import time
 import numpy as np
 import torch
 
+"""
+SmolVLA
+
+[Paper]()
+
+Designed by Hugging Face.
+┌──────────────────────────────┐
+│                 actions      │
+│                    ▲         │
+│ ┌─────────┐      ┌─|────┐    │
+│ |         │────► │      │    │
+│ |         │ kv   │      │    │
+│ |         │────► │Action│    │
+│ |   VLM   │cache │Expert│    |
+│ │         │────► |      │    │
+│ │         │      │      │    │
+│ └▲──▲───▲─┘      └───▲──┘    |
+│  │  |   |            │       |
+│  |  |   |          noise     │
+│  │  │ state                  │
+│  │ language tokens           │
+│  image(s)                    │
+└──────────────────────────────┘
+"""
+
+
 from vision_block import (
     SEQ as SEQ_V, EMBD as EMBD_V,  # SEQ_V==64, EMBD_V==768
     vision_block,
@@ -11,10 +37,10 @@ from vision_block import (
 from llama_block import (    # <-- make this by copying llama rope file, set SEQ=128, USE_ALL_NPU_KERNELS=False
     SEQ as SEQ_MM, EMBD as EMBD_MM, Q_H, KV_H, HEAD_DIM,
     llama_block_rope as vlm_block_rope,   # full VLM self-attn layer (with RoPE on Q,K)
-    vlm_qkv_from_mm_seq,                  # the helper you just added (K,V from pre-norm; Y_vlm full output)
+    vlm_qkv_from_mm_seq, 
 )
 
-from llama_block import (           # <-- your working expert with SEQ=64
+from llama_block import (
     SEQ as SEQ_T, EMBD as EMBD_T,
     llama_q_from_emb_rope,          # pre-norm + Q (RoPE) for text
     expert_cross_attn_from_qkv,     # cross attn Qexp x (Kvlm,Vvlm) + MLP
@@ -70,7 +96,7 @@ def main():
     # 1) Inputs (already-embedded)
     # -----------------------------
     # vision_emb: [64, 768], text_emb: [64, 768]
-    vision_emb = rng.standard_normal((SEQ_V, EMBD_V), dtype=np.float32)
+    image_token = rng.standard_normal((SEQ_V, EMBD_V), dtype=np.float32)
     text_emb   = rng.standard_normal((SEQ_T, EMBD_T), dtype=np.float32)
 
     # -----------------------------
@@ -78,13 +104,13 @@ def main():
     #    get Y_v (for concat).
     # -----------------------------
     t0 = time.perf_counter()
-    Y_v = vision_block(vision_emb, params_vit)
+    vision_emb = vision_block(image_token, params_vit)
     t1 = time.perf_counter()
 
     # -----------------------------
     # 3) Multimodal concat for VLM layer (64 vision + 64 text = 128)
     # -----------------------------
-    mm_seq = np.concatenate([Y_v, text_emb], axis=0)  # [128, 768]
+    mm_seq = np.concatenate([vision_emb, text_emb], axis=0)  # [128, 768]
     assert mm_seq.shape == (SEQ_MM, EMBD_MM)
 
     # -----------------------------
@@ -99,10 +125,11 @@ def main():
     # -----------------------------
     # 5) Expert layer (text-only, 1 depth)
     # -----------------------------
-    residual_exp = text_emb.copy()  # [64, 768]
+    action_noise   = rng.standard_normal((SEQ_T, EMBD_T), dtype=np.float32)
+    residual_exp = action_noise.copy()  # [64, 768]
 
     t4 = time.perf_counter()
-    Q_exp, X_pre_exp = llama_q_from_emb_rope(text_emb, params_exp)             # [64, 960], [64, 768]
+    Q_exp, X_pre_exp = llama_q_from_emb_rope(action_noise, params_exp)             # [64, 960], [64, 768]
     Y_exp = expert_cross_attn_from_qkv(Q_exp, K_vlm, V_vlm, residual_exp, params_exp, causal=True)  # [64, 768]
     t5 = time.perf_counter()
 
@@ -110,8 +137,8 @@ def main():
     # 6) Report shapes + timings
     # -----------------------------
     print("== Shapes ==")
+    print("img_token :", image_token.shape)
     print("vision_emb :", vision_emb.shape)
-    print("Y_v        :", Y_v.shape)
     print("mm_seq     :", mm_seq.shape)
     print("K_vlm      :", K_vlm.shape, "  V_vlm:", V_vlm.shape, "  Y_vlm:", Y_vlm.shape)
     print("Q_exp      :", Q_exp.shape,  "  Y_exp:", Y_exp.shape)
