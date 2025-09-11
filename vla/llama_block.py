@@ -45,10 +45,10 @@ np.random.seed(0)
 # ===============================================================================
 # Model Configuration
 # ===============================================================================
-USE_ALL_NPU_KERNELS = False  # if False, we will offload softmax and silu to cpu
+USE_ALL_NPU_KERNELS = True  # if False, we will offload softmax and silu to cpu
 KERNEL_LIB_PATH = "../cc/"
 BATCH = 1  # fixme: don't care for now
-SEQ = 128
+SEQ = 64
 EMBD = 768  # 64 * 12
 Q_H = 15
 KV_H = 5
@@ -256,6 +256,9 @@ def hadamard_kernel():
 # ##############################################################
 # BUILD
 # ##############################################################
+masked_softmax_mod = df.build(
+    masked_softmax_kernel, target="aie", project="masked_softmax.prj"
+)
 rms_norm_mod = df.build(rms_norm_kernel, target="aie", project="rms_norm.prj")
 linear_matmul_mod = df.build(
     linear_matmul_kernel, target="aie", project="linear_matmul.prj"
@@ -266,9 +269,6 @@ linear_accumulate_mod = df.build(
 attn_score_mod = df.build(
     attn_score_kernel, target="aie", project="attn_score.prj"
 )
-# masked_softmax_mod = df.build(
-#     masked_softmax_kernel, target="aie", project="masked_softmax.prj"
-# )
 silu_mod = df.build(silu_kernel, target="aie", project="silu.prj")
 hadamard_mod = df.build(
     hadamard_kernel, target="aie", project="hadamard.prj"
@@ -335,20 +335,21 @@ def add_residual(residual, x, M, N):
                 ],
             )
 
-# def masked_softmax(attention_score, attention_weight):
-#     row_idx = np.array(list(range(0, SEQ, SOFTMAX_SEQ_TILE)))
-#     for i in range(Q_H // SOFTMAX_HEAD_TILE):
-#         masked_softmax_mod(
-#             attention_score[
-#                 :,
-#                 i * (SOFTMAX_HEAD_TILE * SEQ) : (i + 1) * (SOFTMAX_HEAD_TILE * SEQ),
-#             ],
-#             row_idx,
-#             attention_weight[
-#                 :,
-#                 i * (SOFTMAX_HEAD_TILE * SEQ) : (i + 1) * (SOFTMAX_HEAD_TILE * SEQ),
-#             ],
-#         )
+def masked_softmax(attention_score, attention_weight):
+    row_idx = np.array(list(range(0, SEQ, SOFTMAX_SEQ_TILE)))
+    for i in range(Q_H // SOFTMAX_HEAD_TILE):
+        masked_softmax_mod(
+            attention_score[
+                :,
+                i * (SOFTMAX_HEAD_TILE * SEQ) : (i + 1) * (SOFTMAX_HEAD_TILE * SEQ),
+            ],
+            row_idx,
+            attention_weight[
+                :,
+                i * (SOFTMAX_HEAD_TILE * SEQ) : (i + 1) * (SOFTMAX_HEAD_TILE * SEQ),
+            ],
+        )
+
 def rowwise_hadamard(A, B, C):
     assert A.shape == B.shape == C.shape
     N = A.shape[0]

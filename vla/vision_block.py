@@ -48,7 +48,7 @@ np.random.seed(0)
 # ===============================================================================
 # Model Configuration
 # ===============================================================================
-USE_ALL_NPU_KERNELS = False  # if False, we will offload softmax and gelu to cpu
+USE_ALL_NPU_KERNELS = True  # if False, we will offload softmax and gelu to cpu
 KERNEL_LIB_PATH = "../cc/"
 BATCH = 1  # fixme: don't care for now
 SEQ = 64
@@ -439,7 +439,6 @@ def vision_block(x_fp32: np.ndarray, params: dict):
     linear_projection(activeated_x, params["W_down"], x, SEQ, EMBD, FFN_HID)
     add_residual(residual, x, SEQ, EMBD)
     return residual
-
 
 if __name__ == "__main__":
     ref_model = MiniVit().eval()
