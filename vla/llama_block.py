@@ -461,9 +461,9 @@ def llama_block(x_fp32: np.ndarray, params: dict):
         activeated_x = (silu_func(tensor_gate_proj_x) * tensor_up_proj_x).numpy()
 
     x = np.zeros((SEQ, EMBD)).astype(np.float32)
-    print("x", x.shape)
-    print("W_gate", params["W_gate"].shape)
-    print("gate_proj_x", gate_proj_x.shape)
+    # print("x", x.shape)
+    # print("W_gate", params["W_gate"].shape)
+    # print("gate_proj_x", gate_proj_x.shape)
     linear_projection(activeated_x, params["W_down"], x, SEQ, EMBD, FFN_HID)
     add_residual(residual, x, SEQ, EMBD)
     return residual
