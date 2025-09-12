@@ -57,7 +57,7 @@ HEAD_DIM = 64
 
 FFN_HID = EMBD * 4
 
-assert SEQ == 64, "SEQ must be 64 (to use masked softmax external kernel)"
+# assert SEQ == 64, "SEQ must be 64 (to use masked softmax external kernel)"
 assert EMBD % 64 == 0, "EMBD must be a multiple of 64"
 assert HEAD_DIM % 64 == 0, "HEAD_DIM must be a multiple of 64"
 assert FFN_HID % EMBD == 0, "FFN_HID must be a multiple of FFN_HID size"
@@ -270,7 +270,7 @@ masked_softmax = ExternalModule(
 Tint = int32
 SOFTMAX_P0 = 2
 SOFTMAX_P1 = 3
-SEQ = 64
+# SEQ = 128
 SOFTMAX_HEAD_TILE = SOFTMAX_P1
 SOFTMAX_SEQ_TILE = SEQ // SOFTMAX_P0
 SOFTMAX_Ly = Layout("S1S0")
@@ -480,22 +480,22 @@ def sub32_region():
 # ##############################################################
 # BUILD
 # ##############################################################
-rms_norm_mod = df.build(rms_norm_kernel, target="aie", project="rms_norm.prj")
+masked_softmax_mod = df.build(
+    masked_softmax_kernel, target="aie", project="llama/masked_softmax.prj"
+)
+rms_norm_mod = df.build(rms_norm_kernel, target="aie", project="llama/rms_norm.prj")
 linear_matmul_mod = df.build(
-    linear_matmul_kernel, target="aie", project="linear_matmul.prj"
+    linear_matmul_kernel, target="aie", project="llama/linear_matmul.prj"
 )
 linear_accumulate_mod = df.build(
-    linear_accumulate_kernel, target="aie", project="linear_accumulate.prj"
+    linear_accumulate_kernel, target="aie", project="llama/linear_accumulate.prj"
 )
 attn_score_mod = df.build(
-    attn_score_kernel, target="aie", project="attn_score.prj"
+    attn_score_kernel, target="aie", project="llama/attn_score.prj"
 )
-masked_softmax_mod = df.build(
-    masked_softmax_kernel, target="aie", project="masked_softmax.prj"
-)
-silu_mod = df.build(silu_kernel, target="aie", project="silu.prj")
+silu_mod = df.build(silu_kernel, target="aie", project="llama/silu.prj")
 hadamard_mod = df.build(
-    hadamard_kernel, target="aie", project="hadamard.prj"
+    hadamard_kernel, target="aie", project="llama/hadamard.prj"
 )
 
 radians_mod = df.build(radians_region, target="aie", project="rope/radians.prj")
@@ -513,17 +513,19 @@ sub32_mod   = df.build(sub32_region,   target="aie", project="rope/sub32.prj")
 # ##############################################################
 # TOOL
 # ##############################################################
-def rmsnorm(input_x, weight, output_x):
-    for i in range(SEQ // NORM_SEQ_TILE):
-        tile_input = input_x[i * NORM_SEQ_TILE : (i + 1) * NORM_SEQ_TILE, :]
-        rms_norm_mod(
-            tile_input,
-            weight,
-            # bias,
-            output_x[i * NORM_SEQ_TILE : (i + 1) * NORM_SEQ_TILE, :],
-        )
-
 def linear_projection(A, B, C, M, N, K):
+    assert A.ndim == 2 and B.ndim == 2 and C.ndim == 2, \
+        f"Inputs must be 2D: got A.ndim={A.ndim}, B.ndim={B.ndim}, C.ndim={C.ndim}."
+
+    assert A.shape == (M, K), \
+        f"A.shape {A.shape} does not match (M, K)=({M}, {K})."
+
+    assert B.shape == (K, N), \
+        f"B.shape {B.shape} does not match (K, N)=({K}, {N})."
+
+    assert C.shape == (M, N), \
+        f"C.shape {C.shape} does not match (M, N)=({M}, {N})."
+    
     for i in range(M // LINEAR_M):
         for j in range(N // LINEAR_N):
             C_tmp = np.zeros((LINEAR_M, LINEAR_N)).astype(np.float32)
@@ -548,6 +550,16 @@ def linear_projection(A, B, C, M, N, K):
                         j * LINEAR_N : (j + 1) * LINEAR_N,
                     ],
                 )
+                
+def rmsnorm(input_x, weight, output_x):
+    for i in range(SEQ // NORM_SEQ_TILE):
+        tile_input = input_x[i * NORM_SEQ_TILE : (i + 1) * NORM_SEQ_TILE, :]
+        rms_norm_mod(
+            tile_input,
+            weight,
+            # bias,
+            output_x[i * NORM_SEQ_TILE : (i + 1) * NORM_SEQ_TILE, :],
+        )
 
 def add_residual(residual, x, M, N):
     """
@@ -572,12 +584,11 @@ def add_residual(residual, x, M, N):
             )
 
 def masked_softmax(attention_score, attention_weight):
-    row_idx = np.array(list(range(0, SEQ, SOFTMAX_SEQ_TILE)))
+    row_idx = np.array(list(range(0, SEQ, SOFTMAX_SEQ_TILE))).astype(np.int32)
     for i in range(Q_H // SOFTMAX_HEAD_TILE):
         masked_softmax_mod(
             attention_score[
-                :,
-                i * (SOFTMAX_HEAD_TILE * SEQ) : (i + 1) * (SOFTMAX_HEAD_TILE * SEQ),
+                :, i * SOFTMAX_HEAD_TILE : (i + 1) * SOFTMAX_HEAD_TILE, :
             ],
             row_idx,
             attention_weight[
@@ -688,7 +699,7 @@ def llama_block_rope(x_fp32: np.ndarray, params: dict):
 
 
     # attention score
-    attention_score = np.empty((Q_H, SEQ, SEQ), dtype=np.float32)
+    attention_score = np.empty((SEQ, Q_H, SEQ), dtype=np.float32)
     for i in range(SEQ // ATTN_SCORE_M_TILE):
         for j in range(SEQ // ATTN_SCORE_N_TILE):
             for k in range(Q_H):
@@ -703,8 +714,8 @@ def llama_block_rope(x_fp32: np.ndarray, params: dict):
                         k_key_idx * HEAD_DIM : (k_key_idx + 1) * HEAD_DIM,
                     ],
                     attention_score[
-                        k,
                         i * ATTN_SCORE_M_TILE : (i + 1) * ATTN_SCORE_M_TILE,
+                        k,
                         j * ATTN_SCORE_N_TILE : (j + 1) * ATTN_SCORE_N_TILE,
                     ],
                 )
@@ -715,14 +726,13 @@ def llama_block_rope(x_fp32: np.ndarray, params: dict):
         masked_softmax(attention_score, attn_weight)
     else:
         mask = torch.triu(torch.ones(SEQ, SEQ), 1).bool()
-        mask = np.repeat(mask[np.newaxis, :, :], Q_H, axis=0)
+        mask = np.repeat(mask[:, np.newaxis, :], Q_H, axis=1)
         attention_score[mask == 1] = -np.inf
         tensor_atten_score = torch.from_numpy(attention_score)
         attn_weight = F.softmax(tensor_atten_score, dim=-1)
         attn_weight = attn_weight.numpy()
 
     # attention value
-    ### LOOK HERE
     attn_value = np.zeros((SEQ, Q_H * HEAD_DIM)).astype(np.float32)
     for k in range(Q_H):
         kv_idx = int(k * KV_H // Q_H)
@@ -730,7 +740,7 @@ def llama_block_rope(x_fp32: np.ndarray, params: dict):
             (
                 attn_weight[:, k * SEQ : (k + 1) * SEQ]
                 if USE_ALL_NPU_KERNELS
-                else attn_weight[k, :, :]
+                else attn_weight[:, k, :]
             ),
             value[:, kv_idx * HEAD_DIM : (kv_idx + 1) * HEAD_DIM],
             attn_value[:, k * HEAD_DIM : (k + 1) * HEAD_DIM],
@@ -775,12 +785,11 @@ def llama_block_rope(x_fp32: np.ndarray, params: dict):
     return residual
 
 def llama_block_rope_cross(
-    x_fp32: np.ndarray,
-    params: dict,
     query: np.ndarray,   # [SEQ, Q_H * HEAD_DIM]  (RoPE applied upstream if desired)
     key:   np.ndarray,   # [SEQ, KV_H * HEAD_DIM]
     value: np.ndarray,   # [SEQ, KV_H * HEAD_DIM]
-    causal: bool = False
+    x_fp32: np.ndarray,
+    params: dict,
 ):
     # ##############################################################
     # FORWARD (cross-attn variant: Q/K/V are inputs)
@@ -791,10 +800,8 @@ def llama_block_rope_cross(
     x = np.empty((SEQ, EMBD), dtype=np.float32)
     rmsnorm(residual, params["W_norm_1"], x)
 
-    # ------------------------------
     # attention score
-    # ------------------------------
-    attention_score = np.empty((Q_H, SEQ, SEQ), dtype=np.float32)
+    attention_score = np.empty((SEQ, Q_H, SEQ), dtype=np.float32)
     for i in range(SEQ // ATTN_SCORE_M_TILE):
         for j in range(SEQ // ATTN_SCORE_N_TILE):
             for k in range(Q_H):
@@ -809,23 +816,25 @@ def llama_block_rope_cross(
                         k_key_idx * HEAD_DIM : (k_key_idx + 1) * HEAD_DIM,
                     ],
                     attention_score[
-                        k,
                         i * ATTN_SCORE_M_TILE : (i + 1) * ATTN_SCORE_M_TILE,
+                        k,
                         j * ATTN_SCORE_N_TILE : (j + 1) * ATTN_SCORE_N_TILE,
                     ],
                 )
 
+    # safe softmax
     if USE_ALL_NPU_KERNELS:
         attn_weight = np.zeros((SEQ, Q_H * SEQ)).astype(np.float32)
         masked_softmax(attention_score, attn_weight)
     else:
-        if causal:
-            mask = torch.triu(torch.ones(SEQ, SEQ), 1).bool()
-            mask = np.repeat(mask[np.newaxis, :, :], Q_H, axis=0)
-            attention_score[mask == 1] = -np.inf
+        mask = torch.triu(torch.ones(SEQ, SEQ), 1).bool()
+        mask = np.repeat(mask[:, np.newaxis, :], Q_H, axis=1)
+        attention_score[mask == 1] = -np.inf
         tensor_atten_score = torch.from_numpy(attention_score)
-        attn_weight = F.softmax(tensor_atten_score, dim=-1).numpy()
+        attn_weight = F.softmax(tensor_atten_score, dim=-1)
+        attn_weight = attn_weight.numpy()
 
+    # attention value
     attn_value = np.zeros((SEQ, Q_H * HEAD_DIM)).astype(np.float32)
     for k in range(Q_H):
         kv_idx = int(k * KV_H // Q_H)
@@ -833,7 +842,7 @@ def llama_block_rope_cross(
             (
                 attn_weight[:, k * SEQ : (k + 1) * SEQ]
                 if USE_ALL_NPU_KERNELS
-                else attn_weight[k, :, :]
+                else attn_weight[:, k, :]
             ),
             value[:, kv_idx * HEAD_DIM : (kv_idx + 1) * HEAD_DIM],
             attn_value[:, k * HEAD_DIM : (k + 1) * HEAD_DIM],
@@ -841,16 +850,17 @@ def llama_block_rope_cross(
             HEAD_DIM,
             SEQ,
         )
-
+    # output projection
     x = np.zeros((SEQ, EMBD)).astype(np.float32)
     linear_projection(attn_value, params["Wo"], x, SEQ, EMBD, Q_H * HEAD_DIM)
+    # add residual
     add_residual(residual, x, SEQ, EMBD)
-
+    # norm
     rmsnorm(residual, params["W_norm_2"], x)
-
+    # up projection
     up_proj_x = np.zeros((SEQ, FFN_HID)).astype(np.float32)
     linear_projection(x, params["W_up"], up_proj_x, SEQ, FFN_HID, EMBD)
-
+    # gate projection
     gate_proj_x = np.zeros((SEQ, FFN_HID)).astype(np.float32)
     linear_projection(x, params["W_gate"], gate_proj_x, SEQ, FFN_HID, EMBD)
 
@@ -864,11 +874,14 @@ def llama_block_rope_cross(
         rowwise_hadamard(activeated_x, up_proj_x, activeated_x)
     else:
         tensor_gate_proj_x = torch.from_numpy(gate_proj_x)
-        tensor_up_proj_x   = torch.from_numpy(up_proj_x)
+        tensor_up_proj_x = torch.from_numpy(up_proj_x)
         silu_func = nn.SiLU()
         activeated_x = (silu_func(tensor_gate_proj_x) * tensor_up_proj_x).numpy()
 
     x = np.zeros((SEQ, EMBD)).astype(np.float32)
+    print("x", x.shape)
+    print("W_gate", params["W_gate"].shape)
+    print("gate_proj_x", gate_proj_x.shape)
     linear_projection(activeated_x, params["W_down"], x, SEQ, EMBD, FFN_HID)
     add_residual(residual, x, SEQ, EMBD)
 
@@ -887,96 +900,44 @@ def llama_q_from_emb_rope(text_seq_np: np.ndarray, params: dict):
     x = text_seq_np.astype(np.float32)
 
     # pre-norm
-    X_pre = np.empty((SEQ, EMBD), dtype=np.float32)
+    X_pre = np.zeros((SEQ, EMBD), dtype=np.float32)
     rmsnorm(x, params["W_norm_1"], X_pre)
 
     # Q projection
-    Q_exp = np.zeros((SEQ, Q_H * HEAD_DIM), dtype=np.float32)
+    Q_exp = np.zeros((SEQ, Q_H * HEAD_DIM)).astype(np.float32)
     linear_projection(X_pre, params["Wq"], Q_exp, SEQ, Q_H * HEAD_DIM, EMBD)
 
     Q_exp = rope_apply_packed(Q_exp, heads=Q_H, head_dim=HEAD_DIM)
 
     return Q_exp, X_pre
 
-
-def expert_cross_attn_from_qkv(
-    Q_exp: np.ndarray,     # [SEQ, Q_H*HEAD_DIM]   (RoPE already applied)
-    K_v:   np.ndarray,     # [SEQ, KV_H*HEAD_DIM]
-    V_v:   np.ndarray,     # [SEQ, KV_H*HEAD_DIM]
-    residual: np.ndarray,  # [SEQ, EMBD]  (expert stream before this cross-attn)
-    params_exp: dict,      # {"Wo","W_up","W_gate","W_down"} as np.float32
-    causal: bool = False
-) -> np.ndarray:
+def vlm_qkv_from_mm_seq(x_fp32: np.ndarray, params: dict):
     """
-    Returns: [SEQ, EMBD]
-    Uses same kernels/tiling as your llama_block() attention path.
+    Input:
+      mm_seq_np: [SEQ, EMBD]
+    Output:
+      K_vlm: [SEQ, KV_H*HEAD_DIM]   (no RoPE; for expert cross-attn)
+      V_vlm: [SEQ, KV_H*HEAD_DIM]   (no RoPE; for expert cross-attn)
+      Y_vlm: [SEQ, EMBD]            (post 1-depth VLM self-attn output)
+      X_pre: [SEQ, EMBD]            (pre-norm hidden used to produce K,V)
     """
-    assert Q_exp.shape == (SEQ, Q_H*HEAD_DIM)
-    assert K_v.shape   == (SEQ, KV_H*HEAD_DIM)
-    assert V_v.shape   == (SEQ, KV_H*HEAD_DIM)
-    Nt = SEQ; Nv = SEQ
-    D  = HEAD_DIM
+    assert x_fp32.shape == (SEQ, EMBD)
+    x = x_fp32.astype(np.float32)
+    X_pre = x.reshape(SEQ, EMBD)
+    x = np.empty((SEQ, EMBD), dtype=np.float32)
+    rmsnorm(X_pre, params["W_norm_1"], x)
 
-    # ---- 1) attention scores per q-head (uses your attn_score_mod) ----
-    MS = 32
-    NS = 32
-    scores = np.empty((Q_H, Nt, Nv), dtype=np.float32)
-    for h in range(Q_H):
-        kv_idx = int(h * KV_H // Q_H)  # grouped KV mapping (same as your code)
-        for i in range(Nt // MS):
-            for j in range(Nv // NS):
-                q_blk = Q_exp[i*MS:(i+1)*MS, h*D:(h+1)*D]              # [MS, D]
-                k_blk = K_v[j*NS:(j+1)*NS, kv_idx*D:(kv_idx+1)*D]      # [NS, D]
-                out   = np.empty((MS, NS), dtype=np.float32)
-                attn_score_mod(q_blk, k_blk, out)  # kernel does (Q @ K^T)/sqrt(D)
-                scores[h, i*MS:(i+1)*MS, j*NS:(j+1)*NS] = out
+    key = np.zeros((SEQ, KV_H * HEAD_DIM)).astype(np.float32)
+    value = np.zeros((SEQ, KV_H * HEAD_DIM)).astype(np.float32)
+    linear_projection(x, params["Wk"], key, SEQ, KV_H * HEAD_DIM, EMBD)
+    linear_projection(x, params["Wv"], value, SEQ, KV_H * HEAD_DIM, EMBD)
 
-    if causal:
-        tri = np.triu(np.ones((Nt, Nv), dtype=bool), 1)
-        scores[:, tri] = -np.inf
+    # ----- full VLM layer output (self-attn with RoPE on Q,K inside) -----
+    
+    Y_vlm = llama_block_rope(X_pre, params)
+    Y_vlm = x
 
-    # ---- 2) softmax over Nv ----
-    if USE_ALL_NPU_KERNELS:
-        attn_weight = np.zeros((SEQ, Q_H * SEQ)).astype(np.float32)
-        masked_softmax(scores, attn_weight)
-
-    else:
-        probs = torch.softmax(torch.from_numpy(scores), dim=-1).numpy()
-
-    # ---- 3) value aggregation per head -> ctx [Nt, Q_H*D] ----
-    ctx = np.zeros((Nt, Q_H*D), dtype=np.float32)
-    for h in range(Q_H):
-        kv_idx = int(h * KV_H // Q_H)
-        # [Nt,Nv] @ [Nv,D] -> [Nt,D]
-        linear_projection(
-            probs[h],                                              # [Nt, Nv]
-            V_v[:, kv_idx*D:(kv_idx+1)*D],                        # [Nv, D]
-            ctx[:, h*D:(h+1)*D],                                  # [Nt, D]
-            Nt, D, Nv
-        )
-
-    # ---- 4) output proj + residual ----
-    proj = np.zeros((Nt, EMBD), dtype=np.float32)
-    linear_projection(ctx, params_exp["Wo"], proj, Nt, EMBD, Q_H*D)
-    out = residual.copy()
-    add_residual(out, proj, Nt, EMBD)
-
-    # ---- 5) gated-MLP + residual ----
-    up   = np.zeros((Nt, 4*EMBD), dtype=np.float32)
-    gate = np.zeros((Nt, 4*EMBD), dtype=np.float32)
-    linear_projection(out, params_exp["W_up"],   up,   Nt, 4*EMBD, EMBD)
-    linear_projection(out, params_exp["W_gate"], gate, Nt, 4*EMBD, EMBD)
-
-    if USE_ALL_NPU_KERNELS:
-        # use your SiLU kernel if you have it; otherwise fall back to torch
-        act = (torch.from_numpy(gate).silu() * torch.from_numpy(up)).numpy()
-    else:
-        act = (torch.from_numpy(gate).silu() * torch.from_numpy(up)).numpy()
-
-    down = np.zeros((Nt, EMBD), dtype=np.float32)
-    linear_projection(act, params_exp["W_down"], down, Nt, EMBD, 4*EMBD)
-    add_residual(out, down, Nt, EMBD)
-    return out
+    return key, value, Y_vlm, X_pre
 
 
 import time

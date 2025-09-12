@@ -1,4 +1,3 @@
-# vla_depth1.py
 import time
 import numpy as np
 import torch
@@ -29,33 +28,36 @@ Designed by Hugging Face.
 """
 
 
+from llama_block_rope import (
+    SEQ as SEQ_MM, EMBD as EMBD_MM, Q_H, KV_H, HEAD_DIM,
+    vlm_qkv_from_mm_seq,
+    llama_q_from_emb_rope,          # pre-norm + Q (RoPE) for text
+    llama_block_rope_cross, 
+)
+
 from vision_block import (
     SEQ as SEQ_V, EMBD as EMBD_V,  # SEQ_V==64, EMBD_V==768
     vision_block,
 )
 
-from llama_block import (    # <-- make this by copying llama rope file, set SEQ=128, USE_ALL_NPU_KERNELS=False
-    SEQ as SEQ_MM, EMBD as EMBD_MM, Q_H, KV_H, HEAD_DIM,
-    llama_block_rope as vlm_block_rope,   # full VLM self-attn layer (with RoPE on Q,K)
-    vlm_qkv_from_mm_seq, 
-)
+SEQ_T = 32
+EMBD_T = EMBD_V
 
-from llama_block import (
-    SEQ as SEQ_T, EMBD as EMBD_T,
-    llama_q_from_emb_rope,          # pre-norm + Q (RoPE) for text
-    expert_cross_attn_from_qkv,     # cross attn Qexp x (Kvlm,Vvlm) + MLP
-)
-
-assert SEQ_V == 64 and SEQ_T == 64, "expect 64 vision tokens + 64 text tokens."
+assert SEQ_V == 64 and SEQ_T == 32, SEQ_MM == 64
 assert EMBD_V == EMBD_T == EMBD_MM == 768
-assert SEQ_MM == SEQ_V + SEQ_T == 128, "VLM sequence is 128 (vision + text)."
+# assert SEQ_MM == SEQ_V + SEQ_T == 128, "VLM sequence is 128 (vision + text)."
+
+def token_reduce(x):  # x:[B,S,D]
+    S, D = x.shape
+    assert S % 2 == 0
+    return 0.5 * (x[0::2, :] + x[1::2, :])
 
 def main():
     rng = np.random.default_rng(0)
 
 
-    def rand_mat(m, n): return rng.standard_normal((m, n), dtype=np.float32)
-    def rand_vec(n):    return rng.standard_normal((n,), dtype=np.float32)
+    def rand_mat(m, n): return rng.standard_normal((m, n)).astype(np.float32)
+    def rand_vec(n):    return rng.standard_normal((n,)).astype(np.float32)
 
     # Vision params (ViT-style)
     params_vit = dict(
@@ -95,7 +97,7 @@ def main():
     # -----------------------------
     # 1) Inputs (already-embedded)
     # -----------------------------
-    # vision_emb: [64, 768], text_emb: [64, 768]
+    # vision_emb: [64, 768], text_emb: [32, 768]
     image_token = rng.standard_normal((SEQ_V, EMBD_V), dtype=np.float32)
     text_emb   = rng.standard_normal((SEQ_T, EMBD_T), dtype=np.float32)
 
@@ -105,12 +107,14 @@ def main():
     # -----------------------------
     t0 = time.perf_counter()
     vision_emb = vision_block(image_token, params_vit)
+    # vision_emb = image_token
+    vision_emb = token_reduce(vision_emb) # [64, 768] --> [32, 768]
     t1 = time.perf_counter()
 
     # -----------------------------
-    # 3) Multimodal concat for VLM layer (64 vision + 64 text = 128)
+    # 3) Multimodal concat for VLM layer (32 vision + 32 text = 64)
     # -----------------------------
-    mm_seq = np.concatenate([vision_emb, text_emb], axis=0)  # [128, 768]
+    mm_seq = np.concatenate([vision_emb, text_emb], axis=0)  # [64, 768]
     assert mm_seq.shape == (SEQ_MM, EMBD_MM)
 
     # -----------------------------
@@ -125,12 +129,12 @@ def main():
     # -----------------------------
     # 5) Expert layer (text-only, 1 depth)
     # -----------------------------
-    action_noise   = rng.standard_normal((SEQ_T, EMBD_T), dtype=np.float32)
+    action_noise   = rng.standard_normal((SEQ_MM, EMBD_T), dtype=np.float32)
     residual_exp = action_noise.copy()  # [64, 768]
 
     t4 = time.perf_counter()
     Q_exp, X_pre_exp = llama_q_from_emb_rope(action_noise, params_exp)             # [64, 960], [64, 768]
-    Y_exp = expert_cross_attn_from_qkv(Q_exp, K_vlm, V_vlm, residual_exp, params_exp, causal=True)  # [64, 768]
+    Y_exp = llama_block_rope_cross(Q_exp, K_vlm, V_vlm, residual_exp, params_exp)  # [64, 768]
     t5 = time.perf_counter()
 
     # -----------------------------
@@ -144,9 +148,9 @@ def main():
     print("Q_exp      :", Q_exp.shape,  "  Y_exp:", Y_exp.shape)
 
     print("\n== Timings ==")
-    print(f"Vision enc (1L)      : {(t1 - t0)*1e3:.2f} ms")
-    print(f"VLM layer (1L)       : {(t3 - t2)*1e3:.2f} ms")
-    print(f"Expert x-attn (1L)   : {(t5 - t4)*1e3:.2f} ms")
+    print(f"Vision enc (1L)      : {t1 - t0:.3f} s")
+    print(f"VLM layer (1L)       : {t3 - t2:.3f} s")
+    print(f"Expert x-attn (1L)   : {t5 - t4:.3f} s")
 
 if __name__ == "__main__":
     main()

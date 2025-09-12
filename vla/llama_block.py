@@ -336,12 +336,11 @@ def add_residual(residual, x, M, N):
             )
 
 def masked_softmax(attention_score, attention_weight):
-    row_idx = np.array(list(range(0, SEQ, SOFTMAX_SEQ_TILE)))
+    row_idx = np.array(list(range(0, SEQ, SOFTMAX_SEQ_TILE))).astype(np.int32)
     for i in range(Q_H // SOFTMAX_HEAD_TILE):
         masked_softmax_mod(
             attention_score[
-                :,
-                i * (SOFTMAX_HEAD_TILE * SEQ) : (i + 1) * (SOFTMAX_HEAD_TILE * SEQ),
+            :, i * SOFTMAX_HEAD_TILE : (i + 1) * SOFTMAX_HEAD_TILE, :
             ],
             row_idx,
             attention_weight[
@@ -383,7 +382,7 @@ def llama_block(x_fp32: np.ndarray, params: dict):
     linear_projection(x, params["Wv"], value, SEQ, KV_H * HEAD_DIM, EMBD)
 
     # attention score
-    attention_score = np.empty((Q_H, SEQ, SEQ), dtype=np.float32)
+    attention_score = np.empty((SEQ, Q_H, SEQ), dtype=np.float32)
     for i in range(SEQ // ATTN_SCORE_M_TILE):
         for j in range(SEQ // ATTN_SCORE_N_TILE):
             for k in range(Q_H):
@@ -398,8 +397,8 @@ def llama_block(x_fp32: np.ndarray, params: dict):
                         k_key_idx * HEAD_DIM : (k_key_idx + 1) * HEAD_DIM,
                     ],
                     attention_score[
-                        k,
                         i * ATTN_SCORE_M_TILE : (i + 1) * ATTN_SCORE_M_TILE,
+                        k,
                         j * ATTN_SCORE_N_TILE : (j + 1) * ATTN_SCORE_N_TILE,
                     ],
                 )
@@ -410,7 +409,7 @@ def llama_block(x_fp32: np.ndarray, params: dict):
         masked_softmax(attention_score, attn_weight)
     else:
         mask = torch.triu(torch.ones(SEQ, SEQ), 1).bool()
-        mask = np.repeat(mask[np.newaxis, :, :], Q_H, axis=0)
+        mask = np.repeat(mask[:, np.newaxis, :], Q_H, axis=1)
         attention_score[mask == 1] = -np.inf
         tensor_atten_score = torch.from_numpy(attention_score)
         attn_weight = F.softmax(tensor_atten_score, dim=-1)
@@ -425,7 +424,7 @@ def llama_block(x_fp32: np.ndarray, params: dict):
             (
                 attn_weight[:, k * SEQ : (k + 1) * SEQ]
                 if USE_ALL_NPU_KERNELS
-                else attn_weight[k, :, :]
+                else attn_weight[:, k, :]
             ),
             value[:, kv_idx * HEAD_DIM : (kv_idx + 1) * HEAD_DIM],
             attn_value[:, k * HEAD_DIM : (k + 1) * HEAD_DIM],
